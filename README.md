@@ -4,11 +4,11 @@
                     ╔═══════════════════════════════════════╗
                     ║                                       ║
                     ║    ░░░░░░░░░░░░░░░░░                  ║
-                    ║    ░  ┌─┬─┬─┬─┐  ░                   ║
-                    ║    ░  │╶┼╶┼╶┼╶│  ░  N I G H T L O O M║
-                    ║    ░  │╶┼╶┼╶┼╶│  ░                   ║
-                    ║    ░  │╶┼╶┼╶┼╶│  ░  the loom weaves  ║
-                    ║    ░  └─┴─┴─┴─┘  ░  in darkness.     ║
+                    ║    ░  ┌─┬─┬─┬─┐  ░                    ║
+                    ║    ░  │╶┼╶┼╶┼╶│  ░  N I G H T L O O M ║
+                    ║    ░  │╶┼╶┼╶┼╶│  ░                    ║
+                    ║    ░  │╶┼╶┼╶┼╶│  ░  the loom weaves   ║
+                    ║    ░  └─┴─┴─┴─┘  ░  in darkness.      ║
                     ║    ░░░░░░│░░░░░░░░                    ║
                     ║          ▼                            ║
                     ║                                       ║
@@ -18,7 +18,7 @@
 
 <p align="center">
   <b>Threadless, APC-less process injection through the Windows Loader itself</b><br>
-  <sub>Hijack one pointer in ntdll. The Loader does the rest.<br>
+  <sub>Hijack one pointer in ntdll. The Loader does the rest  .<br>
   CFG doesn't see it. ETW doesn't log it. Payload sits ChaCha20-encrypted until trigger.</sub>
 </p>
 
@@ -41,28 +41,28 @@ The Windows Loader stores a function pointer to `kernel32!CreateActCtxWWorker` i
 
 ```
     ┌──────────────────────────────────────────────────────────────────────┐
-    │                         TARGET PROCESS                              │
-    │                                                                     │
-    │  ntdll .data                                                        │
-    │  ┌────────────────────┐     ┌──────────┐     ┌──────────────────┐   │
-    │  │ CreateActCtxWWorker├────►│  fothk   │     │   Your payload   │   │
-    │  │    slot (8 bytes)  │     │          │     │                  │   │
-    │  └────────┬───────────┘     │ E9 xxxxx │     │  ┌────────────┐ │   │
-    │           │                 │ JMP rel32│     │  │ stub:       │ │   │
-    │           │     OVERWRITE   │    │     │     │  │  save regs  │ │   │
-    │           │◄────────────    │    ▼     │     │  │  restore ptr│ │   │
-    │           │                 │ 48 FF E0 │     │  │  CreateThrd │ │   │
-    │           ▼                 │ JMP RAX ─┼─X──►│  │  jmp orig   │ │   │
-    │                             │ (NO CFG) │     │  └──────┬─────┘ │   │
-    │  Loader calls on every      └──────────┘     │         ▼       │   │
-    │  LoadLibrary ──────────►                     │  ┌────────────┐ │   │
-    │                                              │  │ PIC blob:  │ │   │
-    │                                              │  │ ChaCha20   │ │   │
-    │                                              │  │  decrypt   │ │   │
-    │                                              │  │ RW→RX flip │ │   │
-    │                                              │  │ payload()  │ │   │
-    │                                              │  └────────────┘ │   │
-    │                                              └──────────────────┘   │
+    │                         TARGET PROCESS                               │
+    │                                                                      │
+    │  ntdll .data                                                         │
+    │  ┌────────────────────┐     ┌──────────┐     ┌───────────── ─────┐   │
+    │  │ CreateActCtxWWorker├────►│  fothk   │     │   Your payload    │   │
+    │  │    slot (8 bytes)  │     │          │     │                   │   │
+    │  └────────┬───────────┘     │ E9 xxxxx │     │  ┌─────────────┐  │   │
+    │           │                 │ JMP rel32│     │  │ stub:       │  │   │
+    │           │     OVERWRITE   │    │     │     │  │  save regs  │  │   │
+    │           │◄────────────    │    ▼     │     │  │  restore ptr│  │   │
+    │           │                 │ 48 FF E0 │     │  │  CreateThrd │  │   │
+    │           ▼                 │ JMP RAX ─┼─X──►│  │  jmp orig   │  │   │
+    │                             │ (NO CFG) │     │  └──────┬──────┘  │   │
+    │  LoadLibrary ──────────►                     │  ┌────────────┐   │   │
+    │                                              │  │ PIC blob:  │   │   │
+    │                                              │  │ ChaCha20   │   │   │
+    │                                              │  │  decrypt   │   │   │
+    │                                              │  │ RW→RX flip │   │   │
+    │                                              │  │ payload()  │   │   │
+    │                                              │  └────────────┘   │   │
+    │  Loader calls on every      └──────────┘     │         ▼         │   │
+    │                                              └───────────────────┘   │
     └──────────────────────────────────────────────────────────────────────┘
 
     INJECTOR (this tool)                   ATTACK FLOW
@@ -159,7 +159,7 @@ NightLoom.exe <shellcode.bin> [target]
   +------------------------------------------------------------+
   |  NightLoom                                                 |
   |  Ldr Activation Context Callback Injection                 |
-  |  .data fptr -> fothk JMP RAX (no CFG) | ChaCha20 payload  |
+  |  .data fptr -> fothk JMP RAX (no CFG) | ChaCha20 payload   |
   +------------------------------------------------------------+
 
 [+] Shellcode: payload.bin (276 bytes)
