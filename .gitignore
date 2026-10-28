@@ -1,0 +1,26 @@
+# Build outputs
+x64/
+Debug/
+Release/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.log
+*.tlog
+*.recipe
+*.idb
+*.lastbuildstate
+*.FileListAbsolute.txt
+
+# VS user files
+*.user
+*.suo
+*.sdf
+*.opensdf
+.vs/
+
+# Binaries
+*.bin
