@@ -33,7 +33,7 @@
 
 ## What is this?
 
-The Windows Loader stores a function pointer to `kernel32!CreateActCtxWWorker` in ntdll's writable `.data` section. Every `LoadLibrary` call dispatches through it via a **fothk trampoline** — `JMP RAX` with **zero CFG validation**.
+The Windows Loader stores a function pointer to `kernel32!CreateActCtxWWorker` in ntdll's writable `.data` section. Every `LoadLibrary` call dispatches through it via a **fothk trampoline** - `JMP RAX` with **zero CFG validation**.
 
 **NightLoom** overwrites that pointer. One write. The Loader itself executes your payload on its next DLL load. No `CreateRemoteThread`. No `QueueUserAPC`. No `NtCreateThreadEx`. The target process does the work for you.
 
@@ -80,7 +80,7 @@ The Windows Loader stores a function pointer to `kernel32!CreateActCtxWWorker` i
                                            Stub restores pointer, spawns decrypt thread
 
     5. Flip to RX                          NtProtectVirtualMemory (indirect syscall)
-                                           No RWX pages — only RW → RX transition
+                                           No RWX pages - only RW → RX transition
 
     6. Overwrite the .data pointer         NtWriteVirtualMemory (indirect syscall)
                                            8 bytes. One write. Armed.
@@ -98,37 +98,37 @@ The Windows Loader stores a function pointer to `kernel32!CreateActCtxWWorker` i
 | **No APC** | No `QueueUserAPC` or `NtQueueApcThread` |
 | **No exception abuse** | No VEH/SEH/Vectored handlers |
 | **No DLL loading** | No `LoadLibrary` in the injector's context |
-| **CFG bypass built-in** | fothk dispatch is `JMP RAX` — no CFG bitmap check |
+| **CFG bypass built-in** | fothk dispatch is `JMP RAX` - no CFG bitmap check |
 | **Natural trigger** | Any DLL load in the target fires the payload |
-| **Self-cleaning** | Stub restores original pointer before executing — one-shot |
-| **Encrypted payload** | ChaCha20 (256-bit key, 96-bit nonce) — plaintext never in target memory until trigger |
+| **Self-cleaning** | Stub restores original pointer before executing - one-shot |
+| **Encrypted payload** | ChaCha20 (256-bit key, 96-bit nonce) - plaintext never in target memory until trigger |
 | **Loader Lock safe** | Payload runs in a separate thread, not under the lock |
 | **Dynamic scanning** | Pattern scan finds the slot on any Windows build |
 
 ## Design decisions
 
 ```
- Syscalls     Halo's Gate — SSN resolved at runtime, dispatched through
+ Syscalls     Halo's Gate - SSN resolved at runtime, dispatched through
               a legitimate ntdll syscall;ret instruction (indirect syscall).
               Avoids static SSN tables that break across Windows builds.
 
- API resolve  CRC32B hash-based — no plaintext API strings in the binary.
+ API resolve  CRC32B hash-based - no plaintext API strings in the binary.
               Compile-time constants, no runtime string construction.
 
- Encryption   ChaCha20 (256-bit key, 96-bit nonce) — payload encrypted
+ Encryption   ChaCha20 (256-bit key, 96-bit nonce) - payload encrypted
               before write and stays encrypted in target memory until
               trigger. PIC blob decrypts just-in-time, then re-seals as RX.
 
- Memory       RW → RX only — no PAGE_EXECUTE_READWRITE at any point.
+ Memory       RW → RX only - no PAGE_EXECUTE_READWRITE at any point.
               Payload is written as ciphertext into RW, flipped to RX.
               Decrypt thread briefly flips to RW, then back to RX.
 
- Dispatch     CreateThread from inside target — not CreateRemoteThread.
+ Dispatch     CreateThread from inside target - not CreateRemoteThread.
               Needed to escape Loader Lock; the Loader holds the lock
               when the callback fires, so direct payload execution would
               deadlock on any API that loads a DLL.
 
- Scanner      fothk pattern scan — no hardcoded offsets. Scans ntdll .text
+ Scanner      fothk pattern scan - no hardcoded offsets. Scans ntdll .text
               for MOV RAX,[rip+disp] → CALL fothk sequences and verifies
               the fothk entry resolves to JMP RAX. Survives Windows updates.
 ```
@@ -192,7 +192,7 @@ NightLoom.exe <shellcode.bin> [target]
 ```
 NightLoom/
 ├── src/
-│   ├── Main.c               # Injector — scanner, stub builder, ChaCha20 injection
+│   ├── Main.c               # Injector - scanner, stub builder, ChaCha20 injection
 │   ├── ChaCha20.h/c         # ChaCha20 stream cipher (injector-side encryption)
 │   ├── Common.h              # CRC32B hash constants
 │   ├── NtDefs.h              # NT structure definitions
@@ -219,27 +219,27 @@ The `fothk` (Fast Object Type Help) section in `ntdll.dll` contains trampolines 
 ```asm
 fothk+0x00:  E9 xx xx xx xx       ; JMP rel32 → shared handler
              ...
-shared:      48 FF E0              ; JMP RAX — NO CFG VALIDATION
+shared:      48 FF E0              ; JMP RAX - NO CFG VALIDATION
 ```
 
-This means any function pointer loaded into `RAX` and dispatched through `fothk` **skips CFG entirely**. The Loader uses this path for activation context callbacks — and NightLoom exploits exactly that.
+This means any function pointer loaded into `RAX` and dispatched through `fothk` **skips CFG entirely**. The Loader uses this path for activation context callbacks - and NightLoom exploits exactly that.
 
 ## Prior art
 
 The general idea of overwriting a function pointer in ntdll `.data` is not new. The closest prior work:
 
-- **BaseThreadInitThunk hijacking** ([odzhan](https://github.com/odzhan/injection)) — overwrites `BaseThreadInitThunk` in ntdll `.data`. That pointer is called on thread creation and dispatched through a standard indirect call that **is validated by CFG**. The activation context slot targeted here is called on every `LoadLibrary` and dispatched through `fothk` — a `JMP RAX` with **no CFG bitmap check**. Different pointer, different dispatch path, different CFG story.
+- **BaseThreadInitThunk hijacking** ([odzhan](https://github.com/odzhan/injection)) - overwrites `BaseThreadInitThunk` in ntdll `.data`. That pointer is called on thread creation and dispatched through a standard indirect call that **is validated by CFG**. The activation context slot targeted here is called on every `LoadLibrary` and dispatched through `fothk` - a `JMP RAX` with **no CFG bitmap check**. Different pointer, different dispatch path, different CFG story.
 
-- **PoolParty** ([SafeBreach](https://github.com/SafeBreach-Labs/PoolParty)) — abuses worker factory callbacks in the thread pool. Targets `TP_WORK`/`TP_TIMER`/`TP_WAIT` structures. Different callback surface, requires specific thread pool state.
+- **PoolParty** ([SafeBreach](https://github.com/SafeBreach-Labs/PoolParty)) - abuses worker factory callbacks in the thread pool. Targets `TP_WORK`/`TP_TIMER`/`TP_WAIT` structures. Different callback surface, requires specific thread pool state.
 
-- **KernelCallbackTable** ([modexp](https://modexp.wordpress.com/2019/05/25/windows-injection-finspy/)) — overwrites function pointers in the PEB's `KernelCallbackTable`. Well-documented and widely detected. Targets user-mode GUI callbacks, not Loader dispatch.
+- **KernelCallbackTable** ([modexp](https://modexp.wordpress.com/2019/05/25/windows-injection-finspy/)) - overwrites function pointers in the PEB's `KernelCallbackTable`. Well-documented and widely detected. Targets user-mode GUI callbacks, not Loader dispatch.
 
-- **WNF/FLS callbacks** — various techniques abuse Windows Notification Facility or Fiber Local Storage callbacks. Different structures, different trigger conditions.
+- **WNF/FLS callbacks** - various techniques abuse Windows Notification Facility or Fiber Local Storage callbacks. Different structures, different trigger conditions.
 
 What's specific to this technique:
-- **The target pointer** — `CreateActCtxWWorker` in ntdll `.data`, invoked on every `LoadLibrary` in the process
-- **The CFG gap** — the fothk trampoline dispatches via `JMP RAX` without checking the CFG bitmap, unlike standard indirect calls
-- **Trigger reliability** — DLL loads happen constantly in active processes; no need to force or wait for specific conditions
+- **The target pointer** - `CreateActCtxWWorker` in ntdll `.data`, invoked on every `LoadLibrary` in the process
+- **The CFG gap** - the fothk trampoline dispatches via `JMP RAX` without checking the CFG bitmap, unlike standard indirect calls
+- **Trigger reliability** - DLL loads happen constantly in active processes; no need to force or wait for specific conditions
 
 ## FAQ
 
@@ -247,30 +247,30 @@ What's specific to this technique:
 
 No. Memory transitions `PAGE_READWRITE` → `PAGE_EXECUTE_READ`. There is never a `PAGE_EXECUTE_READWRITE` page. The payload sits **ChaCha20-encrypted** in RX memory. At trigger time, the PIC decrypt blob flips it to RW, decrypts in-place, flips back to RX, then executes. Memory scanners looking for RWX will not flag this.
 
-**"CreateThread is still called — ETW sees it."**
+**"CreateThread is still called - ETW sees it."**
 
-The thread is created from inside the target by the callback stub, not by the injector via `CreateRemoteThread` or `NtCreateThreadEx`. The start address is a PIC blob in a clean RX allocation — not a classic injected-thread signature, but not invisible either. The goal is to avoid the Loader Lock deadlock, not to hide threads.
+The thread is created from inside the target by the callback stub, not by the injector via `CreateRemoteThread` or `NtCreateThreadEx`. The start address is a PIC blob in a clean RX allocation - not a classic injected-thread signature, but not invisible either. The goal is to avoid the Loader Lock deadlock, not to hide threads.
 
 **"Halo's Gate is old."**
 
-It is — [published in 2021](https://blog.sektor7.net/#!res/2021/halosgate.md). It's used here as plumbing for the syscalls, not as the contribution. The contribution is the injection surface: the `fothk` CFG gap and the activation context callback as a hijack target.
+It is - [published in 2021](https://blog.sektor7.net/#!res/2021/halosgate.md). It's used here as plumbing for the syscalls, not as the contribution. The contribution is the injection surface: the `fothk` CFG gap and the activation context callback as a hijack target.
 
 ## Detection
 
 If you're building defenses:
 
-- **Monitor ntdll .data writes** — cross-process writes to ntdll's `.data` section are rare and suspicious
-- **Hook `NtWriteVirtualMemory`** — flag writes targeting ntdll address range in remote processes
-- **Kernel callback on `.data` modification** — the activation context slot rarely changes after init
-- **ETW for `NtProtectVirtualMemory`** — RW→RX transitions in remote processes are a signal
-- **Validate fothk dispatch targets** — check that the pointer still resolves to kernel32/KERNELBASE
-- **Thread start address validation** — flag threads starting in recently-allocated memory regions
+- **Monitor ntdll .data writes** - cross-process writes to ntdll's `.data` section are rare and suspicious
+- **Hook `NtWriteVirtualMemory`** - flag writes targeting ntdll address range in remote processes
+- **Kernel callback on `.data` modification** - the activation context slot rarely changes after init
+- **ETW for `NtProtectVirtualMemory`** - RW→RX transitions in remote processes are a signal
+- **Validate fothk dispatch targets** - check that the pointer still resolves to kernel32/KERNELBASE
+- **Thread start address validation** - flag threads starting in recently-allocated memory regions
 
 Microsoft could patch this by adding CFG validation to the fothk dispatch path.
 
 ## Responsible disclosure
 
-The underlying behavior — fothk dispatching indirect calls without CFG validation — was reported to Microsoft Security Response Center (MSRC) prior to publication. The fothk dispatch path is a design-time property of ntdll's trampoline architecture, not a memory corruption bug, so remediation (adding CFG validation to fothk entries) is at Microsoft's discretion.
+The underlying behavior - fothk dispatching indirect calls without CFG validation - was reported to Microsoft Security Response Center (MSRC) prior to publication. The fothk dispatch path is a design-time property of ntdll's trampoline architecture, not a memory corruption bug, so remediation (adding CFG validation to fothk entries) is at Microsoft's discretion.
 
 This tool is published to help defenders understand the attack surface and build detection. If you discover related issues, report them to [MSRC](https://msrc.microsoft.com/create-report) before publishing.
 
@@ -282,18 +282,18 @@ This tool is published for **security research and educational purposes only**. 
 
 | Topic | Source |
 |:------|:-------|
-| Halo's Gate | [sektor7 — SSN resolution via neighboring stubs](https://blog.sektor7.net/#!res/2021/halosgate.md) |
-| Hell's Gate | [am0nsec/HellsGate — direct syscall invocation](https://github.com/am0nsec/HellsGate) |
-| PoolParty | [SafeBreach — worker factory callback injection](https://github.com/SafeBreach-Labs/PoolParty) |
-| KernelCallbackTable | [modexp — PEB callback pointer hijacking](https://modexp.wordpress.com/2019/05/25/windows-injection-finspy/) |
-| BaseThreadInitThunk | [odzhan — .data pointer hijacking variants](https://github.com/odzhan/injection) |
-| CFG internals | [Microsoft — Control Flow Guard](https://learn.microsoft.com/en-us/windows/win32/secbp/control-flow-guard) |
-| CFG bypass survey | Bania — "Bypassing Control Flow Guard in Windows 10" (CanSecWest, 2019) |
-| Windows Internals | Russinovich, Solomon, Ionescu — *Windows Internals 7th ed.*, Part 1, Ch. 3 (Loader) & Ch. 7 (Security) |
-| Loader internals | [Geoff Chappell — ntdll LDR functions](https://www.geoffchappell.com/studies/windows/win32/ntdll/) |
-| Activation contexts | [Microsoft — SxS / Activation Context API](https://learn.microsoft.com/en-us/windows/win32/sbscs/activation-contexts) |
-| ChaCha20 | [RFC 8439 — ChaCha20-Poly1305](https://datatracker.ietf.org/doc/html/rfc8439) |
-| PE/COFF | [Microsoft — PE format specification](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) |
+| Halo's Gate | [sektor7 - SSN resolution via neighboring stubs](https://blog.sektor7.net/#!res/2021/halosgate.md) |
+| Hell's Gate | [am0nsec/HellsGate - direct syscall invocation](https://github.com/am0nsec/HellsGate) |
+| PoolParty | [SafeBreach - worker factory callback injection](https://github.com/SafeBreach-Labs/PoolParty) |
+| KernelCallbackTable | [modexp - PEB callback pointer hijacking](https://modexp.wordpress.com/2019/05/25/windows-injection-finspy/) |
+| BaseThreadInitThunk | [odzhan - .data pointer hijacking variants](https://github.com/odzhan/injection) |
+| CFG internals | [Microsoft - Control Flow Guard](https://learn.microsoft.com/en-us/windows/win32/secbp/control-flow-guard) |
+| CFG bypass survey | Bania - "Bypassing Control Flow Guard in Windows 10" (CanSecWest, 2019) |
+| Windows Internals | Russinovich, Solomon, Ionescu - *Windows Internals 7th ed.*, Part 1, Ch. 3 (Loader) & Ch. 7 (Security) |
+| Loader internals | [Geoff Chappell - ntdll LDR functions](https://www.geoffchappell.com/studies/windows/win32/ntdll/) |
+| Activation contexts | [Microsoft - SxS / Activation Context API](https://learn.microsoft.com/en-us/windows/win32/sbscs/activation-contexts) |
+| ChaCha20 | [RFC 8439 - ChaCha20-Poly1305](https://datatracker.ietf.org/doc/html/rfc8439) |
+| PE/COFF | [Microsoft - PE format specification](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) |
 
 ---
 
