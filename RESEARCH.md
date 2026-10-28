@@ -10,7 +10,6 @@ We present a Windows process injection technique that exploits an undocumented w
 
 It requires only four core syscall primitives: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, and `NtProtectVirtualMemory` (for the RW→RX transition — no RWX pages are used). It triggers naturally through the target's own DLL loading activity, leaves no persistent hooks, and auto-restores the original pointer after a single execution.
 
-**Keywords:** process injection, activation context, ntdll, loader, CFG bypass, fothk, indirect syscalls
 
 ---
 
