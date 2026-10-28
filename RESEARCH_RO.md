@@ -8,7 +8,7 @@
 
 Prezentăm **GhostCtx**, o tehnică nouă de injectare în procese Windows care exploatează un pointer de funcție nedocumentat și scriibil din secțiunea `.data` a ntdll. În timpul inițializării procesului, Loader-ul Windows (Ldr) stochează adresa internă `CreateActCtxWWorker` din kernel32 la un offset fix în segmentul de date scriibil al ntdll. La fiecare apel `LoadLibrary`, Loader-ul dispatch-uiește prin acest pointer via un **trampolin fothk** — un gadget `JMP RAX` care ocolește complet validarea Control Flow Guard (CFG). Prin suprascrierea acestui singur QWORD dintr-un proces remote, un atacator redirecționează execuția la următorul DLL load natural, fără a crea thread-uri, a pune în coadă APC-uri sau a manipula vreo structură de callback.
 
-GhostCtx necesită doar trei primitive syscall: `NtOpenProcess`, `NtAllocateVirtualMemory` și `NtWriteVirtualMemory`. Se declanșează natural prin activitatea proprie de încărcare DLL a țintei, nu lasă hook-uri persistente și restaurează automat pointerul original după o singură execuție.
+GhostCtx necesită doar patru primitive syscall de bază: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory` și `NtProtectVirtualMemory` (pentru tranziția RW→RX — nu se folosesc pagini RWX). Se declanșează natural prin activitatea proprie de încărcare DLL a țintei, nu lasă hook-uri persistente și restaurează automat pointerul original după o singură execuție.
 
 **Cuvinte cheie:** injectare în proces, activation context, ntdll, loader, bypass CFG, fothk, syscall-uri indirecte
 
@@ -108,7 +108,7 @@ GhostCtx operează în cinci faze:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Faza 0: Inițializare Halo's Gate (rezolvă 6 syscall-uri)│
+│  Faza 0: Inițializare Halo's Gate (rezolvă 7 syscall-uri)│
 ├──────────────────────────────────────────────────────────┤
 │  Faza 1: Localizare slot .data (scanner dinamic 3 metode)│
 ├──────────────────────────────────────────────────────────┤
@@ -163,7 +163,7 @@ DispatchGate:
     jmp qword ptr [target_store] ; salt la instrucțiunea syscall
 ```
 
-Șase syscall-uri sunt rezolvate: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtReadVirtualMemory`, `NtClose`, `NtQueryVirtualMemory`.
+Șapte syscall-uri sunt rezolvate: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtReadVirtualMemory`, `NtProtectVirtualMemory`, `NtClose`, `NtQueryVirtualMemory`.
 
 ### 4.4 Designul Stub-ului de Shellcode
 
@@ -229,30 +229,34 @@ ABI-ul x64 necesită RSP aliniat la 16 bytes înainte de orice instrucțiune `CA
     Patch: slot, orig, payload,       
            CreateThread, orig_jmp     
                                       
- 6. NtAllocateVirtualMemory(RWX)      ───→  [stub|payload] alocat
+ 6. NtAllocateVirtualMemory(RW)       ───→  [stub|payload] alocat
                                       
  7. NtWriteVirtualMemory(stub+pay)    ───→  [stub|payload] scris
                                       
- 8. NtWriteVirtualMemory(slot .data)  ───→  .data+0x6410 = &stub
+ 8. NtProtectVirtualMemory(RX)        ───→  RW → RX (fără RWX în niciun moment)
+                                      
+ 9. NtWriteVirtualMemory(slot .data)  ───→  .data+0x6410 = &stub
                                              ┌──────────────────────┐
                                              │ → adresa stub        │
                                              └──────────────────────┘
                                       
  ─── atacatorul a terminat ───               ... trece timpul ...
                                       
-                                      9. Ținta apelează LoadLibrary (natural)
-                                         → Ldr citește .data+0x6410
-                                         → fothk: JMP RAX → stub
+                                      10. Ținta apelează LoadLibrary (natural)
+                                          → Ldr citește .data+0x6410
+                                          → fothk: JMP RAX → stub
                                       
-                                      10. Stub-ul:
+                                      11. Stub-ul:
                                           a) Restaurează pointerul original
-                                          b) CreateThread(payload)
+                                          b) CreateThread(DecryptAndRun, pParams)
                                           c) JMP la funcția originală
                                       
-                                      11. Thread-ul nou rulează payload-ul
+                                      12. Thread-ul nou (blob-ul PIC DecryptAndRun):
+                                          VirtualProtect(RW) → ChaCha20 decrypt
+                                          → VirtualProtect(RX) → CALL payload
                                           (în afara Loader Lock-ului)
                                       
-                                      12. Procesul continuă normal
+                                      13. Procesul continuă normal
 ```
 
 ---
@@ -265,8 +269,8 @@ ABI-ul x64 necesită RSP aliniat la 16 bytes înainte de orice instrucțiune `CA
 |---|---|
 | **ETW / Monitorizare syscall** | `NtWriteVirtualMemory` vizând secțiunea `.data` a ntdll dintr-un proces remote |
 | **Integritate memorie** | Valoarea `.data+0x6410` din ntdll schimbată la o adresă non-kernel32 |
-| **Creare thread** | Thread nou cu adresă de start într-o alocare `PAGE_EXECUTE_READWRITE` |
-| **Analiză pagini cod** | Alocare RWX conținând un pattern stub → CreateThread → payload |
+| **Creare thread** | Thread nou cu adresă de start într-o regiune `PAGE_EXECUTE_READ` recent alocată |
+| **Tranziții memorie** | `NtProtectVirtualMemory` RW→RX în proces remote, sau secvența RX→RW→RX în-proces (blob-ul de decrypt) |
 
 ### 6.2 Recomandări de Mitigare
 
@@ -289,7 +293,23 @@ Această cercetare este publicată în scopuri defensive și educaționale. Tehn
 
 ---
 
-## 8. Concluzii
+## 8. Implementare: NightLoom
+
+Implementarea de referință a acestei tehnici este **NightLoom** (`NightLoom.exe`). Aceasta extinde primitiva GhostCtx cu funcționalități suplimentare pentru utilizare practică:
+
+**Criptare payload ChaCha20.** Payload-ul este criptat cu o cheie aleatorie de 256 biți și un nonce de 96 biți (generate prin `BCryptGenRandom`) înainte de a fi scris în țintă. Stă ca text cifrat în memorie `PAGE_EXECUTE_READ` până la declanșare. La declanșare, un blob de decrypt position-independent (PIC) efectuează ciclul complet: `VirtualProtect(RW)` → ChaCha20 decrypt in-place → `VirtualProtect(RX)` → `CALL payload`.
+
+Blob-ul PIC este compilat într-o secțiune PE separată (`.nlpic`) în binarul injectorului folosind `#pragma code_seg(".nlpic")`. Motivul: funcția DecryptAndRun trebuie extrasă ca bloc contiguu de bytes și copiată în procesul țintă. O secțiune PE separată garantează că compilatorul nu intercalează alte funcții sau date, nu generează referințe la variabile globale sau tabele de salt, și dimensiunea blob-ului poate fi calculată exact ca diferența între adresele de start și end ale secțiunii. Funcția este compilată cu `__declspec(safebuffers)` pentru a suprima inserția cookie-urilor de stivă (care ar referenția `__security_cookie` — o globală inaccesibilă în procesul țintă).
+
+**Stocarea cheii și nonce-ului.** Cheia, nonce-ul și toate adresele necesare blob-ului de decrypt sunt încorporate într-o structură `DECRYPT_PARAMS` în aceeași alocare RX, transmisă ca `lpParameter` la `CreateThread`. Scopul este anti-scanare-statică — payload-ul nu este niciodată în clar în memoria țintei până în momentul execuției. Aceasta **nu** este confidențialitatea cheii: un atacator cu acces de citire la memoria țintei poate extrage cheia din structura params la un offset cunoscut de la baza alocării.
+
+**Disciplină memorie.** Nu se creează pagini `PAGE_EXECUTE_READWRITE` în niciun moment. Injectorul alocă `PAGE_READWRITE`, scrie toate datele (stub + params + blob PIC + payload criptat), apoi schimbă la `PAGE_EXECUTE_READ` înainte de armarea triggerului. Blob-ul de decrypt schimbă temporar regiunea payload-ului la `PAGE_READWRITE` pentru decriptare, apoi înapoi la `PAGE_EXECUTE_READ` înainte de apel.
+
+**Simplificarea scanner-ului.** Lucrarea (Secțiunea 4.2) documentează trei metode de scanare pentru completitudine. NightLoom folosește doar Metoda 2 (scanare pattern fothk) — s-a dovedit fiabilă pe toate build-urile Windows testate, făcând fallback-ul prin rezoluție export (Metoda 1) și scanarea pe interval (Metoda 3) nenecesare.
+
+**Relația cu această lucrare.** GhostCtx (această lucrare) descrie tehnica de injectare — suprafața de atac, bypass-ul CFG prin fothk, calea de dispatch a Loader-ului. NightLoom este implementarea inginerizată cu funcționalități de nivel producție (criptare ChaCha20, blob PIC de decrypt, scanner dinamic fothk, syscall-uri indirecte Halo's Gate). Tehnica este aceeași; implementarea adaugă hardening operațional.
+
+## 9. Concluzii
 
 GhostCtx demonstrează că structurile de date interne ale ntdll Windows rămân o suprafață de atac bogată. Mecanismul de dispatch al activation context-ului din Loader — proiectat pentru performanță via trampolinul fothk — creează o primitivă de execuție de cod care ocolește CFG, accesibilă prin operațiuni standard de memorie virtuală. Tehnica nu necesită drepturi de creare thread-uri, nu pune APC-uri în coadă și se declanșează natural prin activitatea proprie de încărcare DLL a țintei.
 
@@ -297,7 +317,7 @@ Combinația de:
 - **Pointer de funcție scriibil** în `.data` a ntdll (neprotejat de `.mrdata`)
 - **Dispatch fothk JMP RAX** (fără validare CFG)
 - **Trigger natural de frecvență ridicată** (fiecare apel LoadLibrary)
-- **Cerințe minime de primitive** (3 syscall-uri: open + alloc + write)
+- **Cerințe minime de primitive** (4 syscall-uri: open + alloc + write + protect)
 
 ...face din aceasta un vector de injectare practic și stealth. Sperăm că această divulgare ajută comunitatea defensivă să dezvolte detecții adecvate și încurajează Microsoft să întărească această cale de dispatch.
 
@@ -307,14 +327,19 @@ Combinația de:
 
 | Fișier | Descriere |
 |---|---|
-| `GhostCtx/Main.c` | Tool complet — Halo's Gate, rezoluție dinamică, stub CreateThread |
-| `ghostctx_poc.c` | PoC minimal cross-proces (NT API direct, offset hard-codat) |
-| `poc_actctx2.c` | PoC local — hook-uiește toți 3 pointerii actctx, confirmă frecvența de declanșare |
-| `verify_actctx.c` | Utilitar de analiză — dezasamblează lanțul de dispatch fothk |
-| `check_dispatch.c` | Verificare pattern JMP RAX fothk |
-| `GhostVEH/HalosGate.c` | Resolver SSN Halo's Gate cu parcurgere vecini |
-| `GhostVEH/PebResolver.c` | Rezoluție modul + API bazată pe PEB cu API set v2-v6 |
-| `GhostVEH/SyscallDispatch.asm` | Dispatcher syscall indirect (PrepareGate/DispatchGate) |
+| `src/Main.c` | Injectorul NightLoom — scanner, stub builder, criptare ChaCha20, injectare |
+| `src/ChaCha20.h/c` | Cifru stream ChaCha20 (criptare pe partea injectorului) |
+| `src/Common.h` | Constante hash CRC32B pentru rezoluție API/modul |
+| `src/HalosGate.h/c` | Resolver SSN Halo's Gate cu parcurgere vecini |
+| `src/PebResolver.h/c` | Rezoluție modul + API bazată pe PEB cu API set v2-v6 |
+| `src/MemReadGadget.h/c` | Scanner gadget `mov rax,[rax];ret` pentru citiri remote sigure |
+| `src/SyscallDispatch.asm` | Dispatcher syscall indirect (PrepareGate/DispatchGate) |
+| `src/GadgetDispatch.asm` | Dispatch gadget citire memorie |
+| `src/Crc32Hash.c` | Calcul hash CRC32B |
+| `src/NtDefs.h` | Definiții structuri NT |
+| `src/Trace.h/c` | Logging debug |
+
+> **Notă:** PoC-urile originale de dezvoltare (`ghostctx_poc.c`, `poc_actctx2.c`, `verify_actctx.c`, `check_dispatch.c`) au fost folosite în timpul cercetării pentru validarea individuală a fiecărui pas al tehnicii. Funcționalitatea lor a fost absorbită integral în `src/Main.c` (NightLoom). PoC-urile nu sunt incluse în repo-ul publicat — `src/Main.c` este implementarea de referință completă.
 
 ## Anexa B: Mediul Testat
 
@@ -339,4 +364,4 @@ Cercetarea PoolParty de la SafeBreach (2023) a documentat injectarea prin work i
 
 ---
 
-*GhostCtx — Xorganic, 2026*
+*GhostCtx / NightLoom — Xorganic, 2026*

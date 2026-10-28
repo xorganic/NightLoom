@@ -39,6 +39,7 @@
 // API hashes (case-sensitive)
 #define CRC32B_CREATETHREAD                     0x906A06B0
 #define CRC32B_CREATEACTCTXWWORKER              0x75231A0C
+#define CRC32B_VIRTUALPROTECT                   0x10066F2F
 
 // Module hashes (case-insensitive)
 #define CRC32B_NTDLLDLL                         0x84C05E40

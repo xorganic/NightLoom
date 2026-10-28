@@ -80,6 +80,7 @@
     <ClCompile Include="src\HalosGate.c" />
     <ClCompile Include="src\MemReadGadget.c" />
     <ClCompile Include="src\PebResolver.c" />
+    <ClCompile Include="src\ChaCha20.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\Common.h" />
@@ -88,6 +89,7 @@
     <ClInclude Include="src\MemReadGadget.h" />
     <ClInclude Include="src\PebResolver.h" />
     <ClInclude Include="src\NtDefs.h" />
+    <ClInclude Include="src\ChaCha20.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="src\SyscallDispatch.asm">
