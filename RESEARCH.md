@@ -1,4 +1,4 @@
-# GhostCtx — Ldr Activation Context Callback Injection
+# GhostCtx - Ldr Activation Context Callback Injection
 
 **A Process Injection Technique via ntdll's Writable Function Pointer Dispatch**
 
@@ -6,9 +6,9 @@
 
 ## Abstract
 
-We present a Windows process injection technique that exploits an undocumented writable function pointer in ntdll's `.data` section. During process initialization, the Windows loader (Ldr) stores kernel32's internal `CreateActCtxWWorker` address at a fixed offset within ntdll's writable data segment. On every `LoadLibrary` call, the Ldr dispatches through this pointer via a **fothk trampoline** — a `JMP RAX` gadget that bypasses Control Flow Guard (CFG) validation entirely. By overwriting this single QWORD from a remote process, an attacker redirects execution on the next natural DLL load without creating threads, queuing APCs, or manipulating any callback structures.
+We present a Windows process injection technique that exploits an undocumented writable function pointer in ntdll's `.data` section. During process initialization, the Windows loader (Ldr) stores kernel32's internal `CreateActCtxWWorker` address at a fixed offset within ntdll's writable data segment. On every `LoadLibrary` call, the Ldr dispatches through this pointer via a **fothk trampoline** - a `JMP RAX` gadget that bypasses Control Flow Guard (CFG) validation entirely. By overwriting this single QWORD from a remote process, an attacker redirects execution on the next natural DLL load without creating threads, queuing APCs, or manipulating any callback structures.
 
-It requires only four core syscall primitives: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, and `NtProtectVirtualMemory` (for the RW→RX transition — no RWX pages are used). It triggers naturally through the target's own DLL loading activity, leaves no persistent hooks, and auto-restores the original pointer after a single execution.
+It requires only four core syscall primitives: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, and `NtProtectVirtualMemory` (for the RW→RX transition - no RWX pages are used). It triggers naturally through the target's own DLL loading activity, leaves no persistent hooks, and auto-restores the original pointer after a single execution.
 
 
 ---
@@ -17,7 +17,7 @@ It requires only four core syscall primitives: `NtOpenProcess`, `NtAllocateVirtu
 
 Process injection is a fundamental offensive capability on Windows, enabling code execution within the address space of another process. Established techniques include DLL injection via `CreateRemoteThread`, APC injection, thread hijacking, and various callback-based methods targeting structures such as the Vectored Exception Handler (VEH) chain, WNF callbacks, FLS callbacks, `KernelCallbackTable`, and others.
 
-Modern defenses — particularly **Control Flow Guard (CFG)** and **Arbitrary Code Guard (ACG)** have significantly raised the bar. CFG validates indirect call targets against a bitmap of legitimate addresses, while ACG prevents dynamic code generation. Most published injection techniques require either creating new threads (detected by ETW), queuing APCs (monitored by EDR), or targeting callback structures that are now protected by CFG validation.
+Modern defenses - particularly **Control Flow Guard (CFG)** and **Arbitrary Code Guard (ACG)** have significantly raised the bar. CFG validates indirect call targets against a bitmap of legitimate addresses, while ACG prevents dynamic code generation. Most published injection techniques require either creating new threads (detected by ETW), queuing APCs (monitored by EDR), or targeting callback structures that are now protected by CFG validation.
 
 We identified an overlooked attack surface: the **Loader's activation context dispatch mechanism**. The Windows Loader stores function pointers for activation context operations in ntdll's writable `.data` section. These pointers are called through a dedicated **fothk** (fast-over-the-hook) trampoline section that uses `JMP RAX`, a register-indirect jump that does **not** pass through CFG's `__guard_dispatch_icall_fptr` validation. This creates a reliable, CFG-bypassing code execution primitive triggered by any `LoadLibrary` call in the target process.
 
@@ -75,7 +75,7 @@ The critical observation: **`JMP RAX` is an unconditional register-indirect jump
 
 ### 2.3 Trigger Frequency
 
-The `CreateActCtxWWorker` pointer at `.data+0x6410` is called on **every `LoadLibrary`/`LdrLoadDll` invocation**. In processes like `explorer.exe`, DLL loads occur constantly due to shell extensions, COM activation, and background tasks. This means the injected code fires within seconds without any explicit trigger — the target process triggers it through its own normal operation.
+The `CreateActCtxWWorker` pointer at `.data+0x6410` is called on **every `LoadLibrary`/`LdrLoadDll` invocation**. In processes like `explorer.exe`, DLL loads occur constantly due to shell extensions, COM activation, and background tasks. This means the injected code fires within seconds without any explicit trigger  the target process triggers it through its own normal operation.
 
 ---
 
@@ -125,13 +125,13 @@ GhostCtx operates in five phases:
 
 Hard-coded offsets break across Windows versions. GhostCtx uses a three-method cascade to locate the target pointer at runtime:
 
-**Method 1 — Export Resolution:** Attempt to resolve `CreateActCtxWWorker` from kernel32 by name and scan ntdll `.data` for a matching value. This works when kernel32 exports the worker function.
+**Method 1  Export Resolution:** Attempt to resolve `CreateActCtxWWorker` from kernel32 by name and scan ntdll `.data` for a matching value. This works when kernel32 exports the worker function.
 
-**Method 2 — Pattern Scan (primary):** Scan ntdll's `.text` section for the instruction pattern:
+**Method 2  Pattern Scan (primary):** Scan ntdll's `.text` section for the instruction pattern:
 ```asm
-MOV RAX, [RIP+disp32]   ; 48 8B 05 xx xx xx xx — loads .data pointer
+MOV RAX, [RIP+disp32]   ; 48 8B 05 xx xx xx xx  loads .data pointer
 ; ... (within 48 bytes) ...
-CALL fothk_entry         ; E8 xx xx xx xx — calls into fothk section
+CALL fothk_entry         ; E8 xx xx xx xx  calls into fothk section
 ```
 For each match, verify that:
 1. The RIP-relative displacement resolves to an address within `.data`
@@ -141,11 +141,11 @@ For each match, verify that:
 
 This method is version-independent because it identifies the pointer by its **usage pattern**, not its offset.
 
-**Method 3 — Fallback Range Scan:** If pattern scanning fails (e.g., Ldr code was restructured), scan `.data+0x6300..0x6500` for kernel32 code pointers. The activation context pointer cluster has resided in this range across all observed Windows 10/11 builds.
+**Method 3  Fallback Range Scan:** If pattern scanning fails (e.g., Ldr code was restructured), scan `.data+0x6300..0x6500` for kernel32 code pointers. The activation context pointer cluster has resided in this range across all observed Windows 10/11 builds.
 
 ### 4.3 Halo's Gate Indirect Syscalls
 
-All NT API calls use **Halo's Gate** — a technique that resolves System Service Numbers (SSNs) dynamically by walking neighboring syscall stubs in ntdll's export table. If the target stub is hooked (first bytes are not `4C 8B D1; B8 xx xx 00 00`), GhostCtx walks up and down by stride 32 (the standard stub size), examining ±255 neighbors until an unhooked stub is found. The SSN is computed as `neighbor_SSN ± distance`.
+All NT API calls use **Halo's Gate** - a technique that resolves System Service Numbers (SSNs) dynamically by walking neighboring syscall stubs in ntdll's export table. If the target stub is hooked (first bytes are not `4C 8B D1; B8 xx xx 00 00`), GhostCtx walks up and down by stride 32 (the standard stub size), examining ±255 neighbors until an unhooked stub is found. The SSN is computed as `neighbor_SSN ± distance`.
 
 Syscall dispatch is performed through an **indirect `JMP`** to the `syscall` instruction found inside a legitimate neighboring stub, avoiding the hooked stub entirely:
 
@@ -169,11 +169,11 @@ Seven syscalls are resolved: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWrit
 The injected code consists of a **112-byte (0x70) stub** prepended to the user's payload. The stub must handle a critical constraint: **it fires while the Loader Lock is held**. The callback is invoked during `LdrLoadDll` → activation context processing, and the Ldr's critical section is actively owned by the calling thread.
 
 **Loader Lock Deadlock Problem:**
-If the payload calls any function that triggers a DLL load (e.g., `WinExec` → `CreateProcess` → `LoadLibrary`), it will attempt to re-acquire the Loader Lock on the same thread. Since Windows critical sections are recursive, this actually succeeds for the same thread — but `CreateProcess` spawns a new process whose initialization may involve cross-process Ldr operations that deadlock.
+If the payload calls any function that triggers a DLL load (e.g., `WinExec` → `CreateProcess` → `LoadLibrary`), it will attempt to re-acquire the Loader Lock on the same thread. Since Windows critical sections are recursive, this actually succeeds for the same thread - but `CreateProcess` spawns a new process whose initialization may involve cross-process Ldr operations that deadlock.
 
 The real problem is more subtle: `WinExec("calc",1)` calls `CreateProcess`, which internally performs operations that attempt to acquire the Loader Lock in a way that causes a deadlock when called from within the Ldr's own processing path.
 
-**Solution — CreateThread Dispatch:**
+**Solution - CreateThread Dispatch:**
 The stub calls `CreateThread` to spawn the payload in a new thread. `CreateThread` itself does not require the Loader Lock (it calls `NtCreateThreadEx` via syscall). The new thread starts independently, and when it eventually needs the Loader Lock (e.g., if the payload calls `LoadLibrary`), the original thread has already returned from the callback and released the lock.
 
 ```
@@ -300,19 +300,19 @@ The reference implementation of this technique is **NightLoom** (`NightLoom.exe`
 
 **ChaCha20 payload encryption.** The payload is encrypted with a random 256-bit key and 96-bit nonce (generated via `BCryptGenRandom`) before being written to the target. It sits as ciphertext in `PAGE_EXECUTE_READ` memory until triggered. At trigger time, a position-independent (PIC) decrypt blob performs the full cycle: `VirtualProtect(RW)` → ChaCha20 decrypt in-place → `VirtualProtect(RX)` → `CALL payload`.
 
-The PIC blob is compiled into a separate PE section (`.nlpic`) in the injector binary using `#pragma code_seg(".nlpic")`. The reason: the DecryptAndRun function must be extracted as a contiguous block of bytes and copied into the target process. A separate PE section guarantees the compiler does not interleave other functions or data, does not generate references to global variables or jump tables, and the blob size can be computed exactly as the difference between the section's start and end addresses. The function is compiled with `__declspec(safebuffers)` to suppress stack cookie insertion (which would reference `__security_cookie` — a global inaccessible in the target process).
+The PIC blob is compiled into a separate PE section (`.nlpic`) in the injector binary using `#pragma code_seg(".nlpic")`. The reason: the DecryptAndRun function must be extracted as a contiguous block of bytes and copied into the target process. A separate PE section guarantees the compiler does not interleave other functions or data, does not generate references to global variables or jump tables, and the blob size can be computed exactly as the difference between the section's start and end addresses. The function is compiled with `__declspec(safebuffers)` to suppress stack cookie insertion (which would reference `__security_cookie` - a global inaccessible in the target process).
 
-**Key and nonce storage.** The key, nonce, and all addresses needed by the decrypt blob are embedded in a `DECRYPT_PARAMS` struct in the same RX allocation, passed as `lpParameter` to `CreateThread`. The purpose is anti-static-scanning — the payload is never plaintext in the target's memory until the moment of execution. This is **not** key confidentiality: an attacker with read access to the target's memory can extract the key from the params struct at a known offset from the allocation base.
+**Key and nonce storage.** The key, nonce, and all addresses needed by the decrypt blob are embedded in a `DECRYPT_PARAMS` struct in the same RX allocation, passed as `lpParameter` to `CreateThread`. The purpose is anti-static-scanning - the payload is never plaintext in the target's memory until the moment of execution. This is **not** key confidentiality: an attacker with read access to the target's memory can extract the key from the params struct at a known offset from the allocation base.
 
 **Memory discipline.** No `PAGE_EXECUTE_READWRITE` pages are created at any point. The injector allocates `PAGE_READWRITE`, writes all data (stub + params + PIC blob + encrypted payload), then flips to `PAGE_EXECUTE_READ` before arming the trigger. The decrypt blob temporarily flips the payload region to `PAGE_READWRITE` for decryption, then back to `PAGE_EXECUTE_READ` before calling it.
 
-**Scanner simplification.** The paper (Section 4.2) documents three scanner methods for completeness. NightLoom uses only Method 2 (fothk pattern scan) — it proved reliable across all tested Windows builds, making the export-resolution fallback (Method 1) and range-scan fallback (Method 3) unnecessary.
+**Scanner simplification.** The paper (Section 4.2) documents three scanner methods for completeness. NightLoom uses only Method 2 (fothk pattern scan) - it proved reliable across all tested Windows builds, making the export-resolution fallback (Method 1) and range-scan fallback (Method 3) unnecessary.
 
-**Relationship to this paper.** GhostCtx (this paper) describes the injection technique — the attack surface, the fothk CFG gap, the Loader dispatch path. NightLoom is the engineered implementation with production-grade features (ChaCha20 encryption, PIC decrypt blob, dynamic fothk pattern scanner, Halo's Gate indirect syscalls). The technique is the same; the implementation adds operational hardening.
+**Relationship to this paper.** GhostCtx (this paper) describes the injection technique - the attack surface, the fothk CFG gap, the Loader dispatch path. NightLoom is the engineered implementation with production-grade features (ChaCha20 encryption, PIC decrypt blob, dynamic fothk pattern scanner, Halo's Gate indirect syscalls). The technique is the same; the implementation adds operational hardening.
 
 ## 9. Conclusion
 
-GhostCtx demonstrates that Windows ntdll's internal data structures remain a rich attack surface. The Loader's activation context dispatch mechanism — designed for performance via the fothk trampoline — creates a CFG-bypassing code execution primitive accessible through standard virtual memory operations. The technique requires no thread creation rights, no APC queuing, and triggers naturally through the target's own DLL loading activity.
+GhostCtx demonstrates that Windows ntdll's internal data structures remain a rich attack surface. The Loader's activation context dispatch mechanism - designed for performance via the fothk trampoline - creates a CFG-bypassing code execution primitive accessible through standard virtual memory operations. The technique requires no thread creation rights, no APC queuing, and triggers naturally through the target's own DLL loading activity.
 
 The combination of:
 - **Writable function pointer** in ntdll `.data` (not protected by `.mrdata`)
@@ -328,7 +328,7 @@ The combination of:
 
 | File | Description |
 |---|---|
-| `src/Main.c` | NightLoom injector — scanner, stub builder, ChaCha20 encryption, injection |
+| `src/Main.c` | NightLoom injector - scanner, stub builder, ChaCha20 encryption, injection |
 | `src/ChaCha20.h/c` | ChaCha20 stream cipher (injector-side encryption) |
 | `src/Common.h` | CRC32B hash constants for API/module resolution |
 | `src/HalosGate.h/c` | Halo's Gate SSN resolver with neighbor walking |
@@ -340,7 +340,7 @@ The combination of:
 | `src/NtDefs.h` | NT structure definitions |
 | `src/Trace.h/c` | Debug logging |
 
-> **Note:** The original development PoCs (`ghostctx_poc.c`, `poc_actctx2.c`, `verify_actctx.c`, `check_dispatch.c`) were used during research to validate each step of the technique individually. Their functionality has been fully absorbed into `src/Main.c` (NightLoom). The PoCs are not included in the published repo — `src/Main.c` is the complete reference implementation.
+> **Note:** The original development PoCs (`ghostctx_poc.c`, `poc_actctx2.c`, `verify_actctx.c`, `check_dispatch.c`) were used during research to validate each step of the technique individually. Their functionality has been fully absorbed into `src/Main.c` (NightLoom). The PoCs are not included in the published repo - `src/Main.c` is the complete reference implementation.
 
 ## Appendix B: Tested Environment
 
@@ -365,4 +365,4 @@ SafeBreach's PoolParty research (2023) documented injection via Windows Thread P
 
 ---
 
-*GhostCtx / NightLoom — Xorganic, 2026*  
+*GhostCtx / NightLoom - Xorganic, 2026*  
