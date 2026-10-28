@@ -1,14 +1,14 @@
 # GhostCtx — Ldr Activation Context Callback Injection
 
-**A Novel Process Injection Technique via ntdll's Writable Function Pointer Dispatch**
+**A Process Injection Technique via ntdll's Writable Function Pointer Dispatch**
 
 ---
 
 ## Abstract
 
-We present **GhostCtx**, a novel Windows process injection technique that exploits an undocumented writable function pointer in ntdll's `.data` section. During process initialization, the Windows loader (Ldr) stores kernel32's internal `CreateActCtxWWorker` address at a fixed offset within ntdll's writable data segment. On every `LoadLibrary` call, the Ldr dispatches through this pointer via a **fothk trampoline** — a `JMP RAX` gadget that bypasses Control Flow Guard (CFG) validation entirely. By overwriting this single QWORD from a remote process, an attacker redirects execution on the next natural DLL load without creating threads, queuing APCs, or manipulating any callback structures.
+We present a Windows process injection technique that exploits an undocumented writable function pointer in ntdll's `.data` section. During process initialization, the Windows loader (Ldr) stores kernel32's internal `CreateActCtxWWorker` address at a fixed offset within ntdll's writable data segment. On every `LoadLibrary` call, the Ldr dispatches through this pointer via a **fothk trampoline** — a `JMP RAX` gadget that bypasses Control Flow Guard (CFG) validation entirely. By overwriting this single QWORD from a remote process, an attacker redirects execution on the next natural DLL load without creating threads, queuing APCs, or manipulating any callback structures.
 
-GhostCtx requires only four core syscall primitives: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, and `NtProtectVirtualMemory` (for the RW→RX transition — no RWX pages are used). It triggers naturally through the target's own DLL loading activity, leaves no persistent hooks, and auto-restores the original pointer after a single execution.
+It requires only four core syscall primitives: `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, and `NtProtectVirtualMemory` (for the RW→RX transition — no RWX pages are used). It triggers naturally through the target's own DLL loading activity, leaves no persistent hooks, and auto-restores the original pointer after a single execution.
 
 **Keywords:** process injection, activation context, ntdll, loader, CFG bypass, fothk, indirect syscalls
 
@@ -18,9 +18,9 @@ GhostCtx requires only four core syscall primitives: `NtOpenProcess`, `NtAllocat
 
 Process injection is a fundamental offensive capability on Windows, enabling code execution within the address space of another process. Established techniques include DLL injection via `CreateRemoteThread`, APC injection, thread hijacking, and various callback-based methods targeting structures such as the Vectored Exception Handler (VEH) chain, WNF callbacks, FLS callbacks, `KernelCallbackTable`, and others.
 
-Modern defenses — particularly **Control Flow Guard (CFG)** and **Arbitrary Code Guard (ACG)** — have significantly raised the bar. CFG validates indirect call targets against a bitmap of legitimate addresses, while ACG prevents dynamic code generation. Most published injection techniques require either creating new threads (detected by ETW), queuing APCs (monitored by EDR), or targeting callback structures that are now protected by CFG validation.
+Modern defenses — particularly **Control Flow Guard (CFG)** and **Arbitrary Code Guard (ACG)** have significantly raised the bar. CFG validates indirect call targets against a bitmap of legitimate addresses, while ACG prevents dynamic code generation. Most published injection techniques require either creating new threads (detected by ETW), queuing APCs (monitored by EDR), or targeting callback structures that are now protected by CFG validation.
 
-We identified an overlooked attack surface: the **Loader's activation context dispatch mechanism**. The Windows Loader stores function pointers for activation context operations in ntdll's writable `.data` section. These pointers are called through a dedicated **fothk** (fast-over-the-hook) trampoline section that uses `JMP RAX` — a register-indirect jump that does **not** pass through CFG's `__guard_dispatch_icall_fptr` validation. This creates a reliable, CFG-bypassing code execution primitive triggered by any `LoadLibrary` call in the target process.
+We identified an overlooked attack surface: the **Loader's activation context dispatch mechanism**. The Windows Loader stores function pointers for activation context operations in ntdll's writable `.data` section. These pointers are called through a dedicated **fothk** (fast-over-the-hook) trampoline section that uses `JMP RAX`, a register-indirect jump that does **not** pass through CFG's `__guard_dispatch_icall_fptr` validation. This creates a reliable, CFG-bypassing code execution primitive triggered by any `LoadLibrary` call in the target process.
 
 ### 1.1 Threat Model
 
@@ -366,4 +366,4 @@ SafeBreach's PoolParty research (2023) documented injection via Windows Thread P
 
 ---
 
-*GhostCtx / NightLoom — Xorganic, 2026*
+*GhostCtx / NightLoom — Xorganic, 2026*  
